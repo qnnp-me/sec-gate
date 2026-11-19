@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""sec-mcp — 把 sec 包成 MCP stdio 工具（薄客户端，不碰任何秘密）。
+"""MCP stdio 工具：把 sec 包成薄客户端，不碰任何秘密。
 
 工具：
   request_secret  需要真实凭据时调用；返回 {id, url, render}
@@ -14,13 +13,17 @@ import shutil
 import subprocess
 import sys
 
+from . import __version__
+
 SEC = os.environ.get("SEC_BIN") or shutil.which("sec") or "sec"
-VERSION = "0.1.0"
+VERSION = __version__
 
 
 def run_sec_raw(argv, timeout):
     try:
-        proc = subprocess.run([SEC] + argv, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(
+            [SEC] + argv, check=False, capture_output=True, text=True, timeout=timeout
+        )
     except subprocess.TimeoutExpired:
         return 1, f"sec 调用超时（{timeout}s）"
     return proc.returncode, (proc.stdout or proc.stderr or "").strip()
@@ -28,7 +31,9 @@ def run_sec_raw(argv, timeout):
 
 def run_sec(argv, timeout):
     try:
-        proc = subprocess.run([SEC] + argv, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(
+            [SEC] + argv, check=False, capture_output=True, text=True, timeout=timeout
+        )
     except subprocess.TimeoutExpired:
         return 1, {"error": f"sec 调用超时（{timeout}s）"}
     out = (proc.stdout or "").strip()

@@ -11,7 +11,9 @@ set -uo pipefail
 PAT='mu137|172\.19\.|dpanel|/home/linuxbrew|hdl\.qnnp|@pfan\.ltd|\bwjp\b'
 TARGET="${1:-.}"
 
-if grep -rInE --exclude-dir=.git --exclude-dir=.venv --exclude=privacy_scan.sh "$PAT" "$TARGET"; then
+if grep -rInE --exclude-dir=.git --exclude=.git --exclude-dir=.venv --exclude-dir=.venv-ruff \
+  --exclude-dir=build --exclude-dir=dist --exclude-dir='*.egg-info' --exclude-dir=.ruff_cache \
+  --exclude=privacy_scan.sh "$PAT" "$TARGET"; then
   echo "SCAN=FAIL"
   exit 1
 fi

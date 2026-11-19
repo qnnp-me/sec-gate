@@ -4,7 +4,7 @@
 
 ## 定位
 
-`sec` 是一个单文件的密码/凭据输入工具。agent 需要真实凭据去执行命令时，由用户在一个
+`sec` 是一个零运行期依赖（仅标准库）的凭据输入工具，代码在 `src/sec_gate/` 包内。agent 需要真实凭据去执行命令时，由用户在一个
 一次性链接的网页里输入，命令在服务端执行，agent 只拿到**脱敏后的输出**。
 
 目标：
@@ -32,10 +32,17 @@
 
 ## 快速开始
 
-要求 Python 3.11+，只依赖标准库。把两个文件放进 PATH 上的目录并加上执行位：
+要求 Python 3.11+，只依赖标准库。装到当前环境（会得到 `sec` / `sec-mcp` 两个入口）：
 
 ```sh
-install -m 755 sec sec-mcp ~/.local/bin/
+python3 -m venv .venv
+.venv/bin/pip install .
+```
+
+不安装时也可以直接从源码运行：
+
+```sh
+PYTHONPATH=src python3 -m sec_gate request --env DEMO --ttl 120 -- sh -c 'echo "len=${#DEMO}"'
 ```
 
 创建请求（不阻塞，立即打印 `id` 与 `url`）：
@@ -98,14 +105,15 @@ SEC_PUBLIC_BASE=https://sec.example.com sec request ...   # → https://sec.exam
 python3 -m venv .venv
 .venv/bin/pip install ruff==0.17.5
 
-.venv/bin/ruff check tests scripts
-./scripts/privacy_scan.sh                    # 隐私守卫，命中即失败
-python3 -m unittest discover -s tests -v
-./scripts/smoke.sh                           # 端到端冒烟，用隔离 SEC_HOME + 独立端口
+.venv/bin/ruff check .                        # 全量 lint（含 src）
+./scripts/privacy_scan.sh                     # 隐私守卫，命中即失败
+PYTHONPATH=src python3 -m unittest discover -s tests -v
+.venv/bin/pip install .                       # 冒烟用装好的入口
+SEC_BIN=.venv/bin/sec ./scripts/smoke.sh      # 端到端冒烟，用隔离 SEC_HOME + 独立端口
 ```
 
 `scripts/smoke.sh` 不会碰任何已有实例：它用 `mktemp -d` 当 `SEC_HOME`、随机空闲端口，
-结束时 `sec stop` 并删掉临时目录。
+结束时 `sec stop` 并删掉临时目录；`SEC_BIN` 指定要测的可执行文件（默认 PATH 上的 `sec`）。
 
 ## 许可证
 
