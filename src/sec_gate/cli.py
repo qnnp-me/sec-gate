@@ -9,6 +9,7 @@ import time
 from . import DEFAULT_TTL, LASTFILE, PIDFILE, PORTFILE, STATE, configured_port
 from .httpapi import GUIDE_FULL
 from .service import api, ensure_server, healthy, pick_port, read_port, serve
+from .setup import run_setup
 
 
 def remember(rid):
@@ -135,6 +136,10 @@ def cmd_stop(args):
     return 0
 
 
+def cmd_setup(args):
+    return run_setup(dry_run=args.dry_run)
+
+
 def main():
     parser = argparse.ArgumentParser(prog="sec", description="密码链接输入 + 命令注入")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -171,6 +176,10 @@ def main():
 
     p = sub.add_parser("stop")
     p.set_defaults(func=cmd_stop)
+
+    p = sub.add_parser("setup", help="注册 MCP 条目与 skill 到 Multica workspace（默认执行）")
+    p.add_argument("--dry-run", action="store_true", help="只打印命令与归档路径，不执行")
+    p.set_defaults(func=cmd_setup)
 
     p = sub.add_parser("serve")
     p.add_argument("--port", type=int, default=None)
