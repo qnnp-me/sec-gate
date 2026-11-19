@@ -32,11 +32,19 @@
 
 ## 快速开始
 
-要求 Python 3.11+，只依赖标准库。装到当前环境（会得到 `sec` / `sec-mcp` 两个入口）：
+要求 Python 3.11+，只依赖标准库，从**本地目录**安装（本项目不发 PyPI / Release，命令里不写裸包名）。
+装到当前 venv，会得到 `sec` / `sec-mcp` 两个入口：
 
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install .
+```
+
+也可以把入口装进用户级路径（本机未安装 pipx / uv，这两条未验证，CI 也未覆盖）：
+
+```sh
+pipx install .
+uv tool install .
 ```
 
 不安装时也可以直接从源码运行：
@@ -64,6 +72,50 @@ sec wait --last --timeout 150    # 等结果，stdout/stderr 里的值已替换�
 MCP 包装 `sec-mcp` 用 stdio JSON-RPC 暴露 `request_secret` / `secret_status` /
 `secret_guide`，内部只调用 `sec` CLI，不复制服务端逻辑；`sec` 不在 PATH 上时用
 `SEC_BIN=/path/to/sec` 指定。
+
+## 注册到 Multica（`sec setup`）
+
+`sec setup` 把 MCP 入口与 skill 注册到当前 Multica workspace 的库，**默认直接执行**，
+`--dry-run` 不写 workspace：只在本机临时目录生成归档（供打印的两条命令直接引用），
+并打印这两条命令与归档路径：
+
+```sh
+sec setup --dry-run    # 预览：两条命令 + 归档路径
+sec setup              # 执行注册
+```
+
+它做两件事：
+
+1. MCP 条目：`multica workspace mcp add sec --server-config '{"command":"<sec-mcp 绝对路径>","args":[]}'`。
+   JSON 由 setup 按 `shutil.which("sec-mcp")` 填入；找不到时回落裸名 `sec-mcp`。
+2. skill：把包内唯一的 `skills/sec/SKILL.md` 打成临时归档（内层 `sec/SKILL.md`），执行
+   `multica skill import --file <归档> --on-conflict overwrite`。只有服务端拒绝该归档形态时，
+   才回退 `multica skill create/update --content-file`。
+
+`multica` 只从 `PATH` 解析，**不读** `MULTICA_CLI_PATH`。两种降级都不算失败（退出码 0）：
+
+- `multica workspace mcp list` 本身失败 → 只打印两条手工命令，不调用 `workspace mcp add`
+  也不调用 `skill import`；
+- `list` 正常但 `workspace mcp add` 被拒（agent 无权写 workspace MCP 库，退出码 3；`--debug` 下
+  服务端报文是 `agents cannot modify the workspace MCP servers`）→ 打印手工命令，skill 照常写入。
+
+在 agent 运行时里执行 `sec setup` 一般落在上面第二个分支：skill 会写进 workspace，MCP 条目
+需要你在**自己的终端**里复制打印出来的 `multica workspace mcp add ...` 执行一次。
+
+注册只写 workspace 库，**不分配给任何 agent**。需要时手动分配（`server-id` 取自
+`multica workspace mcp list`，`skill-id` 取自 `multica skill list`）：
+
+```sh
+multica agent mcp add <agent-id> <server-id>
+multica agent skills add <agent-id> --skill-ids <skill-id>
+```
+
+回滚：
+
+```sh
+multica skill delete <id> --yes          # 无 --yes 在无 TTY 环境会 Aborted. 且退出码为 0
+multica workspace mcp remove sec         # agent 无权执行，需人工在自己的终端跑
+```
 
 ## 配置
 

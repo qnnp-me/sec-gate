@@ -28,5 +28,8 @@ package-dir = { "" = "src" }
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+sec_gate = ["skills/sec/SKILL.md"]
+
 [tool.setuptools.dynamic]
 version = { attr = "sec_gate.__version__" }
