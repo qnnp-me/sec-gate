@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: ruff
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install ruff==0.17.5
+          # 存量 sec / sec-mcp（单文件、标准库原型）暂不纳入 lint：
+          # 有 10 条 / 2 条存量告警，纳入就必须改行为，超出立项提交的范围。
+          # 拆包后（S2）把它们纳入并清零。
+          .venv/bin/ruff check tests scripts
+
+      - name: privacy scan
+        run: ./scripts/privacy_scan.sh
+
+      - name: unit tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: smoke
+        run: ./scripts/smoke.sh

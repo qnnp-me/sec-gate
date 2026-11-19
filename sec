@@ -1,0 +1,880 @@
+#!/usr/bin/env python3
+"""sec — 单文件密码链接工具：你在网页输入密码，命令拿到它，agent 只看到脱敏输出。
+
+用法
+  sec request [--env NAME]... [--stdin] [--ttl 秒] [--reason 文本] -- <命令> [参数...]
+      创建请求，立即打印 JSON（含 id 与 url）。不阻塞。
+  sec wait <id> [--timeout 秒]
+      等结果，打印 JSON（state / exit / stdout / stderr，值已脱敏）。
+  sec status <id>
+  sec list
+  sec stop
+  sec serve [--port N]          # 内部用，供自拉起调用
+
+约定
+  - 服务常驻在 127.0.0.1:PORT，端口在 30000-30999 里随机（SEC_PORT 可固定），
+    第一次使用时自动拉起并 detach。
+  - 页面固定模板，只接受表单提交；任何 GET 都不返回秘密。
+  - 值只存在于服务进程内存，执行完即丢弃；不写文件、不写日志、不进 argv。
+  - 页面地址 = <SEC_PUBLIC_BASE>/r/<id>；未设置 SEC_PUBLIC_BASE 时回落到
+    http://127.0.0.1:<端口>/r/<id>
+"""
+import argparse
+import fcntl
+import html
+import json
+import os
+import re
+import secrets
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+VERSION = "0.1.0"
+STATE = Path(os.environ.get("SEC_HOME", Path.home() / ".local/state/sec"))
+PIDFILE = STATE / "sec.pid"
+LOCKFILE = STATE / "sec.lock"
+TOKENFILE = STATE / "api.token"
+LOGFILE = STATE / "sec.log"
+LASTFILE = STATE / "last"
+PORTFILE = STATE / "port"
+PORT_MIN = int(os.environ.get("SEC_PORT_MIN", "30000"))
+PORT_MAX = int(os.environ.get("SEC_PORT_MAX", "30999"))
+DEFAULT_TTL = int(os.environ.get("SEC_TTL", "300"))
+MAX_TTL = 1800
+MAX_PENDING = 8
+MAX_VALUE = 16384
+CMD_TIMEOUT = int(os.environ.get("SEC_CMD_TIMEOUT", "120"))
+OUTPUT_LIMIT = 32000
+
+
+def configured_port():
+    """SEC_PORT 固定端口；未设置则每次拉起时随机选。"""
+    raw = os.environ.get("SEC_PORT")
+    return int(raw) if raw else None
+
+
+def public_base(port):
+    override = os.environ.get("SEC_PUBLIC_BASE")
+    if override:
+        return override.rstrip("/")
+    return f"http://127.0.0.1:{port}"
+
+
+# ---------------------------------------------------------------- 状态（仅内存）
+
+class Store:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.items = {}
+
+    def new(self, argv, reason, envs, stdin_mode, ttl):
+        if len([i for i in self.items.values() if i["state"] == "pending"]) >= MAX_PENDING:
+            raise RuntimeError("待处理请求过多，先处理或等它们过期")
+        rid = secrets.token_urlsafe(24)
+        now = time.time()
+        with self.lock:
+            self.items[rid] = {
+                "id": rid, "argv": argv, "reason": reason, "envs": envs,
+                "risk": risk_profile(argv),
+                "stdin": stdin_mode, "created": now, "expires": now + ttl,
+                "state": "pending", "used": False, "result": None,
+            }
+        return rid
+
+    def get(self, rid):
+        with self.lock:
+            return self.items.get(rid)
+
+    def sweep(self):
+        now = time.time()
+        with self.lock:
+            for rid, item in list(self.items.items()):
+                if item["state"] == "pending" and now > item["expires"]:
+                    item["state"] = "expired"
+                if item["state"] != "pending" and now > item["expires"] + 3600:
+                    del self.items[rid]
+
+    def pending(self):
+        with self.lock:
+            return [i for i in self.items.values() if i["state"] == "pending"]
+
+
+STORE = Store()
+
+
+def redact(text, values):
+    """把每个值替换成 [secret:NAME]；短值也要替换（宁可误伤可读性）。"""
+    if not text:
+        return ""
+    for name, value in sorted(values.items(), key=lambda kv: -len(kv[1])):
+        if not value:
+            continue
+        text = text.replace(value, f"[secret:{name}]")
+    return text
+
+
+NET_TOOLS = {"curl", "wget", "nc", "ncat", "netcat", "ssh", "scp", "sftp", "rsync",
+             "telnet", "socat", "dig", "nslookup", "ftp", "httpie", "aria2c"}
+ENCODE_TOOLS = {"base64", "xxd", "od", "openssl", "iconv", "gpg", "uudecode", "uuencode"}
+KNOWN_BINS = {"git", "docker", "docker-compose", "kubectl", "helm", "psql", "mysql", "redis-cli",
+              "sh", "bash", "dash", "zsh", "echo", "printf", "cat", "ls", "cp", "mv", "rm", "mkdir",
+              "jq", "yq", "sed", "awk", "grep", "egrep", "find", "head", "tail", "cut", "sort", "uniq",
+              "python3", "python", "node", "npm", "pnpm", "yarn", "go", "make", "cmake", "brew", "tar",
+              "gzip", "zip", "unzip", "date", "sleep", "env", "which", "test", "true", "false", "xargs",
+              "sha256sum", "md5sum", "wc", "tr", "chmod", "chown", "ln", "readlink", "stat", "du", "df",
+              "sed", "perl", "php", "ruby", "java", "mvn", "gradle", "npm", "npx", "tsc", "eslint",
+              "prettier", "vitest", "jest", "pytest", "ruff", "black", "mypy", "cargo", "rustc",
+              "curl", "wget", "nc", "ssh", "scp", "rsync", "base64", "xxd", "openssl"}
+SENSITIVE_PREFIXES = ("~/.ssh", "/etc/", "~/.config", "~/.local/state", "/root", "~/.gnupg", "/proc/")
+SHELLS = {"sh", "bash", "dash", "zsh"}
+HOST_RE = re.compile(r"(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?", re.I)
+
+
+def risk_profile(argv):
+    """对命令做静态体检：分数决定页面要几次确认。"""
+    prog = os.path.basename(argv[0]) if argv else ""
+    joined = " ".join(argv)
+    score = 0
+    signals, hosts = [], []
+    script = ""
+    tokens = {os.path.basename(a) for a in argv}
+    if prog in SHELLS and "-c" in argv:
+        i = argv.index("-c")
+        script = argv[i + 1] if i + 1 < len(argv) else ""
+        if any(ch in script for ch in (";", "|", "$(", "&&", "||", ">")):
+            score += 25; signals.append("shell 拼接")
+        tokens |= {os.path.basename(t) for t in script.split()}
+    net_hit = sorted(tokens & NET_TOOLS)
+    enc_hit = sorted(tokens & ENCODE_TOOLS)
+    if net_hit:
+        score += 40; signals.append("网络出口：" + "、".join(net_hit))
+    if enc_hit:
+        score += 30; signals.append("编码/变换：" + "、".join(enc_hit))
+    if prog and prog not in KNOWN_BINS:
+        score += 15; signals.append(f"非惯用程序 {prog}")
+    for a in argv:
+        if any(prefix in a for prefix in SENSITIVE_PREFIXES):
+            score += 20; signals.append("涉及敏感路径"); break
+    if len(argv) + len(script.split()) > 40:
+        score += 10; signals.append("命令过长")
+    for match in HOST_RE.finditer(joined):
+        host = match.group(0)
+        if host.replace(".", "").isdigit():
+            continue
+        hosts.append(host)
+    level = "high" if score >= 60 else ("medium" if score >= 30 else "low")
+    return {"score": score, "level": level, "signals": signals, "hosts": sorted(set(hosts))[:6]}
+
+
+def tail(text, limit=OUTPUT_LIMIT):
+    return text if len(text) <= limit else text[-limit:]
+
+
+def run_request(item, values):
+    """在子进程里执行命令：值只进 env 或 stdin，不进 argv。"""
+    env = os.environ.copy()
+    stdin_data = None
+    if item["stdin"]:
+        stdin_data = values["VALUE"]
+    else:
+        env.update(values)
+    try:
+        proc = subprocess.run(
+            item["argv"], env=env,
+            input=stdin_data.encode() if stdin_data is not None else None,
+            capture_output=True, timeout=CMD_TIMEOUT, cwd=os.getcwd(),
+        )
+        code, out, err = proc.returncode, proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace")
+        outcome = "exited"
+    except subprocess.TimeoutExpired:
+        code, out, err, outcome = None, "", f"命令超过 {CMD_TIMEOUT}s 被终止", "timeout"
+    except FileNotFoundError as exc:
+        code, out, err, outcome = None, "", f"无法执行：{exc}", "not-started"
+    except Exception as exc:  # noqa: BLE001
+        code, out, err, outcome = None, "", f"执行失败：{exc}", "error"
+    return {
+        "state": "ran", "outcome": outcome, "exit": code,
+        "stdout": tail(redact(out, values)),
+        "stderr": tail(redact(err, values)),
+        "redacted": sorted(values),
+        "duration_ms": None,
+    }
+
+
+# ---------------------------------------------------------------- 页面
+
+PAGE_CSS = """
+:root{color-scheme:light dark}
+body{font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
+     margin:0;padding:24px;background:#fafafa;color:#111}
+@media(prefers-color-scheme:dark){body{background:#111;color:#eee}code,pre{background:#222!important}
+  input{background:#222;color:#eee;border-color:#444}}
+main{max-width:720px;margin:0 auto}
+h1{font-size:18px;margin:0 0 4px}
+.sub{color:#888;font-size:13px;margin-bottom:20px}
+table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px}
+td{padding:6px 8px;vertical-align:top;border-top:1px solid #ddd}
+td:first-child{width:120px;color:#888;white-space:nowrap}
+pre{background:#f0f0f0;padding:10px;border-radius:6px;overflow:auto;font-size:13px;margin:0}
+label{display:block;margin:14px 0 4px;font-size:13px;color:#888}
+input[type=password],input[type=text]{width:100%;box-sizing:border-box;padding:8px 10px;
+     font-size:15px;border:1px solid #ccc;border-radius:6px}
+button{padding:7px 16px;font-size:14px;border-radius:6px;border:1px solid #ccc;background:#fff;cursor:pointer}
+button.primary{background:#2563eb;border-color:#2563eb;color:#fff}
+button.danger{color:#b91c1c}
+.row{display:flex;gap:10px;align-items:center;margin-top:18px}
+.note{color:#888;font-size:12px;margin-top:14px}
+.err{color:#b91c1c;font-weight:600}
+"""
+
+
+def page(title, body, extra_head=""):
+    return (
+        "<!doctype html><html lang=zh><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        f"<title>{html.escape(title)}</title><style>{PAGE_CSS}</style>{extra_head}</head>"
+        f"<body><main>{body}</main></body></html>"
+    )
+
+
+def render_review(item):
+    left = max(0, int(item["expires"] - time.time()))
+    argv = shlex.join(item["argv"])
+    risk = item.get("risk") or {"level": "low", "signals": [], "hosts": [], "score": 0}
+    level = risk["level"]
+    badge = {"low": ("低", "#16a34a"), "medium": ("中", "#f59e0b"), "high": ("高", "#dc2626")}[level]
+    rows = [
+        ("动作", "<code>" + html.escape(argv) + "</code>"),
+        ("理由", html.escape(item["reason"] or "")),
+        ("注入方式", "stdin（命令从标准输入读取）" if item["stdin"]
+         else "环境变量 " + " ".join(f"<code>{html.escape(n)}</code>" for n in item["envs"])),
+        ("有效期", f"{left} 秒后作废"),
+    ]
+    if risk.get("signals"):
+        rows.append(("风险信号", "、".join(html.escape(x) for x in risk["signals"])))
+    if risk.get("hosts"):
+        rows.append(("目标主机", " ".join(f"<code>{html.escape(h)}</code>" for h in risk["hosts"])))
+    table = "<table>" + "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in rows) + "</table>"
+
+    if item["stdin"]:
+        fields = ('<label>密码</label>'
+                  '<input type=password name=value autocomplete=off required '
+                  'autofocus data-1p-ignore data-lpignore=true data-bwignore>')
+    else:
+        fields = "".join(
+            f'<label>{html.escape(n)}</label>'
+            f'<input type=password name="v_{html.escape(n)}" autocomplete=off required '
+            f'data-1p-ignore data-lpignore=true data-bwignore>'
+            for n in item["envs"])
+
+    if level == "medium":
+        extra = ('<label style="display:flex;gap:8px;align-items:center;color:inherit">'
+                 '<input type=checkbox name=ack value=1 required>'
+                 '我已核对上面的命令与目标主机</label>')
+    elif level == "high":
+        extra = ('<label>高风险：请输入 RUN 确认</label>'
+                 '<input name=confirm placeholder="RUN" autocomplete=off required>')
+    else:
+        extra = ""
+
+    body = (
+        f"<h1>请求执行命令</h1>"
+        f"<div class=sub>风险 <span style='color:{badge[1]};font-weight:600'>{badge[0]}</span>"
+        f"（score {risk.get('score', 0)}）</div>"
+        f"{table}"
+        f"<form method=post action='/r/{item['id']}'>"
+        f"{fields}{extra}"
+        "<div class=row><button class=primary name=decision value=run type=submit>注入并执行</button>"
+        "<button class=danger name=decision value=deny type=submit formnovalidate>拒绝</button></div>"
+        "</form>"
+        "<div class=note>密码只存在服务内存里，执行完即丢弃；不写盘、不进日志、不进对话。"
+        "输出中出现的值会被替换为 [secret:NAME]。</div>"
+    )
+    return page("请求执行命令", body)
+
+
+def render_done(item):
+    result = item["result"] or {}
+    state = item["state"]
+    if state == "denied":
+        return page("已拒绝", "<h1>已拒绝</h1><div class=note>没有执行任何命令。</div>")
+    if state == "expired":
+        return page("已过期", "<h1>已过期</h1><div class=note>请求已作废，没有执行。</div>")
+    if not result:
+        return page("执行中", "<h1>执行中…</h1><div class=note>可以关闭此页，结果会回给 agent。</div>")
+    out = html.escape(result.get("stdout") or "")
+    err = html.escape(result.get("stderr") or "")
+    body = (f"<h1>已执行</h1><div class=sub>退出码 {result.get('exit')} · "
+            f"{'完成' if result.get('outcome') == 'exited' else result.get('outcome')}</div>"
+            + (f"<label>stdout</label><pre>{out}</pre>" if out else "")
+            + (f"<label>stderr</label><pre>{err}</pre>" if err else "")
+            + "<div class=note>上面的输出里，密码已被替换为 [secret:NAME]。</div>")
+    return page("已执行", body)
+
+
+# ---------------------------------------------------------------- 可粘贴的渲染块
+
+GUIDE_SHORT = (
+    "拿到 url 后：① 立刻把下面的 render 文本原样贴进回复（它是 markdown，不是 html）；"
+    "② 同一回合执行 sec wait --last --timeout 150 并回报 result.render；"
+    "③ 绝不回显值、绝不要求用户把密码发到聊天里；④ 用户拒绝或过期就如实报告，不重试绕过；"
+    "⑤ 要重跑就新建请求。"
+)
+
+GUIDE_FULL = """使用 sec 的硬性规则（防漂移）
+
+1. 链接：拿到 url 后立刻贴 `render` 里的 markdown，不要拖到下一轮，不要只给 id。
+2. 等待：同一回合执行 `sec wait --last --timeout 150`；超时返回 pending 时下一轮用 `sec status --last` 续查（id 记在 ~/.local/state/sec/last），不要重复创建请求。
+3. 渲染：`render` 字段是纯 markdown（标题、代码块、链接），逐字保留——命令、链接、退出码、脱敏标记都不要改写；不要套进 ```html 围栏。
+4. 秘密：绝不打印、回显、转述密码，也不要把 `[secret:NAME]` 还原成值；不要要求用户把密码发到聊天里。
+5. 拒绝/过期：如实报告，不得改命令或换参数重试；需要重跑就新建请求并说明原因。
+6. 一次执行：一个请求只执行一次；重复提交会被 410 拒绝，不要试图绕过。
+7. 说明：结果里 `redacted` 列出的字段，要在回复里明确告诉用户"已脱敏"。
+"""
+
+
+def _block(lang, text):
+    fence = "~~~"
+    return f"{fence}{lang}\n{text.rstrip()}\n{fence}"
+
+
+def risk_line(item):
+    risk = item.get("risk") or {}
+    level = {"low": "低", "medium": "中", "high": "高"}.get(risk.get("level", "low"), "低")
+    parts = [f"**{level}**（score {risk.get('score', 0)}）"]
+    if risk.get("signals"):
+        parts.append("、".join(risk["signals"]))
+    if risk.get("hosts"):
+        parts.append("目标主机：" + "、".join(f"`{h}`" for h in risk["hosts"]))
+    return " · ".join(parts)
+
+
+def md_pending(item, url):
+    left = max(0, int(item["expires"] - time.time()))
+    inject = "stdin" if item["stdin"] else "env " + ", ".join(f"`{n}`" for n in item["envs"])
+    return "\n".join([
+        "### 🔐 sec · 等待确认执行",
+        "",
+        f"**{item['reason'] or '执行命令'}**",
+        "",
+        _block("sh", shlex.join(item["argv"])),
+        f"- 注入：{inject}",
+        f"- 风险：{risk_line(item)}",
+        f"- 有效期：{left}s（成功后链接立即作废）",
+        "- 密码只提交到该页面，不进对话、不发模型",
+        "",
+        f"**[打开并输入密码 →]({url})**",
+    ])
+
+
+def md_result(item):
+    result = item["result"] or {}
+    state = item["state"]
+    cmd = _block("sh", shlex.join(item["argv"]))
+    if state == "denied":
+        return "\n".join(["### ⛔ sec · 已拒绝", "", cmd, "没有执行任何命令。"])
+    if state == "expired":
+        return "\n".join(["### ⌛ sec · 已过期", "", cmd, "链接到期作废，命令没有执行。"])
+    if not result:
+        return "\n".join(["### ⏳ sec · 执行中", "", cmd, "结果稍后返回。"])
+    ok = result.get("exit") == 0 and result.get("outcome") == "exited"
+    redacted = result.get("redacted") or []
+    meta = (f"`exit {result.get('exit')}` · `{result.get('outcome')}` · "
+            f"`{result.get('duration_ms')}ms`")
+    if redacted:
+        meta += " · 已脱敏：" + ", ".join(f"`{n}`" for n in redacted)
+    lines = [f"### {'✅' if ok else '⚠️'} sec · {'执行完成' if ok else '执行结束'}", "", meta, "", cmd]
+    for label in ("stdout", "stderr"):
+        text = result.get(label) or ""
+        if text.strip():
+            lines += ["", f"**{label}**", _block("text", text)]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- HTTP
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "sec/" + VERSION
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), fmt % args))
+
+    def _send(self, code, body, ctype="text/html; charset=utf-8", extra=None):
+        data = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8")
+
+    def _auth_ok(self):
+        token = TOKENFILE.read_text().strip() if TOKENFILE.exists() else ""
+        return bool(token) and self.headers.get("X-Sec-Token") == token
+
+    def _base(self):
+        return public_base(self.server.server_address[1])
+
+    def _host_ok(self):
+        host = self.headers.get("Host", "")
+        if host.startswith("127.0.0.1") or host.startswith("localhost"):
+            return True
+        base = urllib.parse.urlsplit(self._base())
+        return host == base.netloc
+
+    def _body(self, limit=MAX_VALUE * 2):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > limit:
+            raise ValueError("请求体过大")
+        return self.rfile.read(length).decode("utf-8", "replace")
+
+    def do_GET(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/healthz":
+            return self._json(200, {"ok": True, "pid": os.getpid(), "version": VERSION})
+        if not self._host_ok():
+            return self._send(404, page("未找到", "<h1>404</h1>"))
+        parts = [p for p in path.split("/") if p]
+        if len(parts) >= 2 and parts[0] == "r":
+            item = STORE.get(parts[1])
+            if not item:
+                return self._send(404, page("无效链接", "<h1>无效或已失效的链接</h1>"))
+            if item["state"] == "pending":
+                return self._send(200, render_review(item))
+            if item["state"] in ("denied", "expired"):
+                return self._send(200, render_done(item))
+            return self._send(200, render_done(item))
+        return self._send(404, page("未找到", "<h1>404</h1>"))
+
+    def do_POST(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/api/request":
+            if not self._auth_ok():
+                return self._json(403, {"error": "forbidden"})
+            try:
+                payload = json.loads(self._body())
+                argv = [str(a) for a in payload.get("argv") or []]
+                if not argv:
+                    raise ValueError("argv 不能为空")
+                envs = [str(n) for n in payload.get("envs") or []]
+                stdin_mode = bool(payload.get("stdin"))
+                if not envs and not stdin_mode:
+                    raise ValueError("必须指定 --env 或 --stdin")
+                if envs and stdin_mode:
+                    raise ValueError("--env 与 --stdin 不能同时使用")
+                for name in envs:
+                    if not name.replace("_", "").isalnum() or not name[0].isalpha():
+                        raise ValueError(f"非法环境变量名：{name}")
+                ttl = max(30, min(MAX_TTL, int(payload.get("ttl") or DEFAULT_TTL)))
+                rid = STORE.new(argv, str(payload.get("reason") or ""), envs, stdin_mode, ttl)
+            except Exception as exc:  # noqa: BLE001
+                return self._json(400, {"error": str(exc)})
+            item = STORE.get(rid)
+            url = f"{self._base()}/r/{rid}"
+            return self._json(200, {
+                "id": rid, "url": url,
+                "expires": int(item["expires"]), "ttl": ttl,
+                "instructions": GUIDE_SHORT,
+                "render": md_pending(item, url),
+            })
+        if path == "/api/pending":
+            if not self._auth_ok():
+                return self._json(403, {"error": "forbidden"})
+            items = [{
+                "id": i["id"], "argv": i["argv"], "reason": i["reason"],
+                "expires": int(i["expires"]), "risk": i["risk"],
+            } for i in STORE.pending()]
+            return self._json(200, {"pending": items})
+        if path == "/api/status":
+            if not self._auth_ok():
+                return self._json(403, {"error": "forbidden"})
+            try:
+                rid = str(json.loads(self._body()).get("id") or "")
+            except Exception:  # noqa: BLE001
+                return self._json(400, {"error": "bad body"})
+            item = STORE.get(rid)
+            if not item:
+                return self._json(404, {"error": "not found"})
+            url = f"{self._base()}/r/{rid}"
+            if item["state"] == "pending":
+                return self._json(200, {
+                    "id": rid, "state": "pending", "expires": int(item["expires"]), "url": url,
+                    "instructions": GUIDE_SHORT,
+                    "render": md_pending(item, url),
+                })
+            return self._json(200, {
+                "id": rid, "state": item["state"], "expires": int(item["expires"]),
+                "result": item["result"] or {},
+                "render": md_result(item),
+            })
+        parts = [p for p in path.split("/") if p]
+        if len(parts) == 2 and parts[0] == "r":
+            item = STORE.get(parts[1])
+            if not item:
+                return self._send(404, page("无效链接", "<h1>无效或已失效的链接</h1>"))
+            if item["state"] != "pending" or item["used"]:
+                return self._send(410, page("已作废", "<h1>这个链接已经用过了</h1>"))
+            try:
+                form = urllib.parse.parse_qs(self._body(), keep_blank_values=True)
+            except Exception as exc:  # noqa: BLE001
+                return self._send(400, page("格式错误", f"<h1>格式错误</h1><p>{html.escape(str(exc))}</p>"))
+            decision = (form.get("decision") or [""])[0]
+            item["used"] = True
+            if decision != "run":
+                item["state"] = "denied"
+                return self._send(303, "", extra={"Location": f"/r/{item['id']}/done"})
+            risk = item.get("risk") or {}
+            if risk.get("level") == "medium" and (form.get("ack") or [""])[0] != "1":
+                item["used"] = False
+                return self._send(400, page("需要确认",
+                    "<h1>请先勾选「我已核对命令」</h1><p>返回上一页重新提交。</p>"))
+            if risk.get("level") == "high" and (form.get("confirm") or [""])[0].strip() != "RUN":
+                item["used"] = False
+                return self._send(400, page("需要确认",
+                    "<h1>高风险命令：请在确认框输入 RUN</h1><p>返回上一页重新提交。</p>"))
+            if item["stdin"]:
+                value = (form.get("value") or [""])[0]
+                if not value.strip():
+                    item["used"] = False
+                    return self._send(400, page("缺少密码", "<h1>密码为空</h1>"))
+                values = {"VALUE": value}
+            else:
+                values = {}
+                for name in item["envs"]:
+                    value = (form.get("v_" + name) or [""])[0]
+                    if not value.strip():
+                        item["used"] = False
+                        return self._send(400, page("缺少密码", f"<h1>{html.escape(name)} 为空</h1>"))
+                    if len(value) > MAX_VALUE:
+                        item["used"] = False
+                        return self._send(413, page("过大", "<h1>值过长</h1>"))
+                    values[name] = value
+            item["state"] = "running"
+            started = time.time()
+            def work():
+                result = run_request(item, values)
+                result["duration_ms"] = int((time.time() - started) * 1000)
+                item["result"] = result
+                item["state"] = "ran"
+            threading.Thread(target=work, daemon=True).start()
+            return self._send(303, "", extra={"Location": f"/r/{item['id']}/done"})
+        return self._json(404, {"error": "not found"})
+
+
+def serve(port):
+    STATE.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(STATE, 0o700)
+    except OSError:
+        pass
+    if not TOKENFILE.exists():
+        TOKENFILE.write_text(secrets.token_urlsafe(32))
+        os.chmod(TOKENFILE, 0o600)
+    PIDFILE.write_text(str(os.getpid()))
+    PORTFILE.write_text(str(port))
+    httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    httpd.daemon_threads = True
+    httpd.allow_reuse_address = True
+
+    def sweeper():
+        while True:
+            time.sleep(5)
+            try:
+                STORE.sweep()
+            except Exception:  # noqa: BLE001
+                pass
+
+    threading.Thread(target=sweeper, daemon=True).start()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: threading.Thread(target=httpd.shutdown, daemon=True).start())
+    sys.stderr.write(f"sec {VERSION} listening on 0.0.0.0:{port} pid={os.getpid()}\n")
+    sys.stderr.flush()
+    try:
+        httpd.serve_forever()
+    finally:
+        try:
+            PIDFILE.unlink()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- 客户端
+
+def api(port, path, payload):
+    token = TOKENFILE.read_text().strip()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}", method="POST",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "X-Sec-Token": token},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        try:
+            detail = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            detail = {"error": raw or str(exc)}
+        detail["http_status"] = exc.code
+        raise RuntimeError(detail.get("error") or str(exc)) from None
+
+
+def healthy(port, timeout=0.6):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=timeout) as resp:
+            return json.loads(resp.read()).get("ok") is True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def read_port():
+    fixed = configured_port()
+    if fixed:
+        return fixed
+    try:
+        return int(PORTFILE.read_text().strip())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def pick_port():
+    fixed = configured_port()
+    if fixed:
+        return fixed
+    for _ in range(60):
+        port = PORT_MIN + secrets.randbelow(max(1, PORT_MAX - PORT_MIN + 1))
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                probe.bind(("0.0.0.0", port))
+            return port
+        except OSError:
+            continue
+    raise SystemExit(f"{PORT_MIN}-{PORT_MAX} 里找不到空闲端口")
+
+
+def ensure_server():
+    port = read_port()
+    if port and healthy(port):
+        return port
+    STATE.mkdir(parents=True, exist_ok=True)
+    with open(LOCKFILE, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        port = read_port()
+        if port and healthy(port):
+            return port
+        port = pick_port()
+        log = open(LOGFILE, "ab", buffering=0)  # noqa: SIM115
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "serve", "--port", str(port)],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+            start_new_session=True, close_fds=True,
+        )
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if healthy(port, 0.3):
+                PORTFILE.write_text(str(port))
+                return port
+            time.sleep(0.15)
+        raise SystemExit(f"服务拉不起来（端口 {port}），看日志：{LOGFILE}")
+
+
+def remember(rid):
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        LASTFILE.write_text(rid)
+        os.chmod(LASTFILE, 0o600)
+    except OSError:
+        pass
+
+
+def last_id():
+    try:
+        rid = LASTFILE.read_text().strip()
+    except OSError:
+        rid = ""
+    return rid or None
+
+
+def die(msg, code=1):
+    print(json.dumps({"error": msg}, ensure_ascii=False))
+    sys.exit(code)
+
+
+def cmd_request(args):
+    argv = list(args.command)
+    if not argv:
+        die("缺少命令：在 -- 之后写")
+    if bool(args.env) == bool(args.stdin):
+        die("必须且只能选一种注入方式：--env NAME（可重复）或 --stdin")
+    port = ensure_server()
+    payload = {"argv": argv, "envs": args.env or [], "stdin": args.stdin,
+               "reason": args.reason or "", "ttl": args.ttl}
+    try:
+        out = api(port, "/api/request", payload)
+    except Exception as exc:  # noqa: BLE001
+        die(f"创建请求失败：{exc}")
+    remember(out["id"])
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_wait(args):
+    rid = args.id or last_id()
+    if not rid:
+        die("没有请求 id，也没有 --last 记录")
+    port = ensure_server()
+    deadline = time.time() + args.timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            out = api(port, "/api/status", {"id": rid})
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc)
+            if msg == "not found":
+                die("请求不存在：服务重启会丢弃内存中的请求，请重新 sec request")
+            die(f"查询失败：{msg}")
+        last = out
+        if out.get("state") in ("ran", "denied", "expired"):
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+            return 0
+        time.sleep(1)
+    print(json.dumps(last or {"id": rid, "state": "pending"}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_status(args):
+    rid = args.id or last_id()
+    if not rid:
+        die("没有请求 id，也没有 --last 记录")
+    port = ensure_server()
+    try:
+        out = api(port, "/api/status", {"id": rid})
+    except Exception as exc:  # noqa: BLE001
+        if str(exc) == "not found":
+            die("请求不存在：服务重启会丢弃内存中的请求，请重新 sec request")
+        die(f"查询失败：{exc}")
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_guide(args):
+    print(GUIDE_FULL, end="")
+    return 0
+
+
+def cmd_render(args):
+    rid = args.id or last_id()
+    if not rid:
+        die("没有请求 id，也没有 --last 记录")
+    port = ensure_server()
+    out = api(port, "/api/status", {"id": rid})
+    print(out.get("render") or "")
+    return 0
+
+
+def cmd_list(args):
+    port = ensure_server()
+    out = api(port, "/api/pending", {})
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_stop(args):
+    if not PIDFILE.exists():
+        print(json.dumps({"stopped": False, "reason": "没有 pid 文件"}, ensure_ascii=False))
+        return 0
+    try:
+        pid = int(PIDFILE.read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"stopped": False, "reason": str(exc)}, ensure_ascii=False))
+        return 1
+    port = read_port()
+    for _ in range(30):
+        if not port or not healthy(port, 0.2):
+            break
+        time.sleep(0.1)
+    try:
+        PORTFILE.unlink()
+    except OSError:
+        pass
+    print(json.dumps({"stopped": True, "pid": pid}, ensure_ascii=False))
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="sec", description="密码链接输入 + 命令注入")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("request")
+    p.add_argument("--env", action="append", default=[])
+    p.add_argument("--stdin", action="store_true")
+    p.add_argument("--ttl", type=int, default=DEFAULT_TTL)
+    p.add_argument("--reason", default="")
+    p.add_argument("command", nargs=argparse.REMAINDER)
+    p.set_defaults(func=cmd_request)
+
+    p = sub.add_parser("wait")
+    p.add_argument("id", nargs="?")
+    p.add_argument("--last", action="store_true", help="用最近一次 request 的 id")
+    p.add_argument("--timeout", type=int, default=150, help="等待秒数，默认 150")
+    p.set_defaults(func=cmd_wait)
+
+    p = sub.add_parser("status")
+    p.add_argument("id", nargs="?")
+    p.add_argument("--last", action="store_true")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("render")
+    p.add_argument("id", nargs="?")
+    p.add_argument("--last", action="store_true")
+    p.set_defaults(func=cmd_render)
+
+    p = sub.add_parser("guide")
+    p.set_defaults(func=cmd_guide)
+
+    p = sub.add_parser("list")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("stop")
+    p.set_defaults(func=cmd_stop)
+
+    p = sub.add_parser("serve")
+    p.add_argument("--port", type=int, default=None)
+    def _serve(args):
+        serve(args.port or configured_port() or pick_port())
+        return 0
+    p.set_defaults(func=_serve)
+
+    args = parser.parse_args()
+    # argparse.REMAINDER 会保留前导 "--"，去掉它
+    if args.cmd == "request" and args.command and args.command[0] == "--":
+        args.command = args.command[1:]
+    sys.exit(args.func(args) or 0)
+
+
+if __name__ == "__main__":
+    main()
