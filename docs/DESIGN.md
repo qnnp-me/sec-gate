@@ -5,7 +5,8 @@
 
 ## 1. 定位
 
-单文件密码/凭据输入工具：agent 需要真实凭据执行命令时，由用户在一个一次性链接的网页里
+单文件时代的密码/凭据输入工具，现已按 `src/sec_gate/` 包拆分，只依赖标准库：
+agent 需要真实凭据执行命令时，由用户在一个一次性链接的网页里
 输入值，命令在服务端执行，agent 只拿到脱敏后的输出。
 
 ### 目标
@@ -144,20 +145,20 @@ agent 能改代码、起假服务、读 `/proc/<pid>/environ`。第 4.2 节的�
 
 | 路径 | 内容 |
 |---|---|
-| `sec` | 服务端 + CLI，单文件、仅标准库 |
-| `sec-mcp` | MCP stdio 薄包装，子进程调用 `sec` |
-| `tests/test_privacy.py` | 隐私守卫自测（标准库 unittest） |
+| `src/sec_gate/` | 服务端 + CLI + MCP 实现（`store` / `runner` / `risk` / `httpapi` / `service` / `cli` / `mcp`） |
+| `pyproject.toml` | 打包基线：零运行期依赖，`sec` / `sec-mcp` 两个入口 |
+| `tests/test_*.py` | 隐私守卫自测 + `store` / `runner` / `risk` 单测（标准库 unittest） |
 | `scripts/privacy_scan.sh` | 隐私守卫：扫描真实主机名/域名/路径/邮箱/用户名 |
 | `scripts/smoke.sh` | 端到端冒烟：隔离 `SEC_HOME` + 独立端口 |
 | `.github/workflows/ci.yml` | ruff（pin 0.17.5）+ 隐私守卫 + 单测 + 冒烟 |
 
 ## 6. 演进方向
 
-当前是两个单文件原型，行为已由 `scripts/smoke.sh` 与 `tests/` 兜住。后续按独立可验收的
-阶段演进：
+当前是 `src/sec_gate/` 包（`sec` / `sec-mcp` 两个 console script），行为已由
+`scripts/smoke.sh` 与 `tests/` 兜住。后续按独立可验收的阶段演进：
 
-1. **拆包**：`store / runner / risk / http / cli / mcp` 六个模块，行为不变，拆包前后同一组
-   端到端输出一致；存量 lint 告警清零并纳入 CI。
+1. ~~**拆包**~~（已完成 S2）：`store / runner / risk / httpapi / service / cli / mcp` 模块边界，
+   行为不变，拆包前后同一组端到端输出一致；存量 lint 告警清零并纳入 CI。
 2. **接入**：MCP 注册、skill、一条命令完成安装；MCP 不可用时回落到 CLI。
 3. **部署与凭据**：宿主/独立容器部署、凭据来源、审计与限流——每条都是独立决策，需要单独
    确认，不混在代码重构里做。

@@ -1,6 +1,11 @@
 .venv/
+.venv-ruff/
 __pycache__/
 *.py[cod]
+*.egg-info/
+build/
+dist/
+.ruff_cache/
 *.log
 .env
 .env.local
