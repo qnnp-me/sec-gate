@@ -1,0 +1,1 @@
+本仓库的环境事实见 `.multica/PROJECT.md`；改动构建/测试命令或依赖时，同 PR 更新（跑 `.multica/scripts/profile.sh --write`）。
