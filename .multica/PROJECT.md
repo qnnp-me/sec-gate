@@ -8,17 +8,17 @@
 - 团队规则（分级、安全触发词、收口格式）不在本文件里，留在 workspace 一处，避免 N 个仓库 N 份副本漂移。
 
 <!-- profile:facts:begin -->
-last_verified: a8c13b1
+last_verified: ee1cd2b
 last_verified_at: 2026-11-20
 
 ## 指纹
 
 - default_branch: main
-- head: a8c13b1
+- head: ee1cd2b
 - deps: pyproject.toml=f65a04110ab3
 - ci: .github/workflows/ci.yml=72c274f7b2fa
-- top_dirs: .github docs scripts src tests
-- top_dirs_sha: 01bcccf043a7
+- top_dirs: .github .multica docs scripts src tests
+- top_dirs_sha: 55da8985deef
 - cmd_build_test_sha: 438cae45691d
 
 ## 命令
